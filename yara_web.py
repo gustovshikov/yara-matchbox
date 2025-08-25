@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+import html
+import http.server
+import os
+import re
+import subprocess
+import uuid
+from http.server import ThreadingHTTPServer
+from string import Template
+
+# =========================
+# Configuration
+# =========================
+SERVER_PORT = 8080
+
+# Upload limits (set the cap once here)
+MAX_UPLOAD_MB = 100  # <-- change this single number to adjust the upload limit
+UPLOAD_SIZE_LIMIT_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Host paths (ensure these exist)
+HOST_RULES_DIR = "rules"
+HOST_SCANS_DIR = "scans"
+DEFAULT_RULES_FILE_NAME = "rules.yara"  # inside HOST_RULES_DIR
+
+# Container paths (mount directories, not files/wildcards)
+CONTAINER_RULES_DIR = "/data/rules"
+CONTAINER_SCANS_DIR = "/data/scans"
+
+# Docker image and long-lived container name
+DOCKER_IMAGE_NAME = "local/so-strelka-backend:2.4.160"       # set to your image name
+EXEC_CONTAINER_NAME = "yara-daemon"  # name of the long-lived container
+
+# YARA 3.11-safe flags (NO -X)
+YARA_CLI_FLAGS = ["-w", "-s", "-m", "-e", "-g"]
+
+# Docker run safety limits for the long-lived container
+DOCKER_RUNTIME_LIMITS = [
+    "--network", "none",
+    "--cpus", "1",
+    "--memory", "256m",
+    "--pids-limit", "64",
+    "--read-only",
+    "--security-opt", "no-new-privileges",
+]
+
+# Subprocess timeout
+YARA_SUBPROCESS_TIMEOUT_SECONDS = 60
+
+# Candidate YARA binary paths to probe inside the container (DRY)
+YARA_BIN_CANDIDATES = ("yara", "/usr/bin/yara", "/usr/local/bin/yara")
+# Cache the selected YARA binary once discovered
+SELECTED_YARA_BIN = None
+
+# Limit extremely large outputs to keep UI responsive
+MAX_YARA_OUTPUT_LINES = 50000
+
+# Read-drain helper chunk size
+READ_CHUNK_SIZE = 64 * 1024  # 64 KiB
+
+# =========================
+# HTML Template (string.Template) — with strong wrapping for long strings
+# =========================
+HTML_PAGE_TEMPLATE = Template("""<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>YARA Scanner (offline-safe, docker exec)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- All styles are inline; no external fonts, CSS, or scripts -->
+    <style>
+      :root {
+        --card-bg: #ffffff;
+        --muted: #666;
+        --line: #e8e8e8;
+        --chip: #eef2f7;
+        --chip-text: #333;
+        --accent: #0b69ff;
+        --ok-bg: #dff2bf;
+        --ok-text: #4f8a10;
+        --err-bg: #ffbaba;
+        --err-text: #a40000;
+      }
+      * { box-sizing: border-box; }
+
+      /* System-font stacks only (all local to the OS) */
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                     Roboto, Helvetica, Arial, "Noto Sans", "Liberation Sans", sans-serif;
+        line-height: 1.6; color: #333; max-width: 1000px;
+        margin: 2rem auto; padding: 0 1rem; background: #fafafa;
+      }
+      h1, h2, h3 { color: #111; margin: 0 0 .75rem 0; }
+
+      form { background-color: #fcfcfc; padding: 1.25rem; border-radius: 10px;
+             border: 1px solid #ddd; margin-bottom: 2rem; }
+      input[type="file"] { display: block; margin-bottom: .75rem; }
+      input[type="submit"] { background-color: var(--accent); color: white; padding: 10px 16px;
+                             border: none; border-radius: 6px; cursor: pointer; font-size: 16px; }
+      input[type="submit"]:hover { filter: brightness(.95); }
+      .hint { font-size: 0.9em; color: var(--muted); margin-top: .5rem; }
+      .results-container { margin-top: 2rem; }
+
+      .rule-card { background: var(--card-bg); border: 1px solid var(--line); border-radius: 12px;
+                   margin-bottom: 1.5rem; padding: 1rem 1rem 1.25rem; box-shadow: 0 2px 8px rgba(0,0,0,.04); }
+      .rule-header { display:flex; flex-wrap:wrap; align-items:baseline; gap:.75rem; margin-bottom:.5rem; }
+      .rule-title code { font-size: 1.05rem; }
+      .rule-meta-top { color: var(--muted); font-size:.95rem; margin-bottom:.5rem; }
+      .tags-container { margin: .25rem 0 .75rem 0; display:flex; flex-wrap:wrap; gap:.4rem; }
+      .tag { display:inline-block; background-color: var(--chip); color: var(--chip-text); padding: 2px 8px;
+             border-radius: 999px; font-size: 0.85em; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco,
+             Consolas, "Liberation Mono", "DejaVu Sans Mono", "Courier New", monospace;
+             border: 1px solid #dde3ea; }
+
+      /* Tables and code: force long tokens to wrap instead of overflowing */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;  /* enables wrapping within cells */
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                     "Liberation Mono", "DejaVu Sans Mono", "Courier New", monospace;
+        margin-top: .75rem;
+      }
+      th, td {
+        border: 1px solid var(--line);
+        text-align: left;
+        padding: 10px;
+        vertical-align: top;
+        word-break: break-word;     /* wrap very long tokens */
+        overflow-wrap: anywhere;    /* modern, robust wrapping */
+      }
+      th { background-color: #f7f9fb; font-weight: 600; }
+      tr:nth-child(even) td { background-color: #fbfcfe; }
+
+      code {
+        background: #f6f7f9;
+        padding: 0 4px;
+        border-radius: 4px;
+        display: inline-block;      /* allows max-width to apply */
+        max-width: 100%;
+        white-space: pre-wrap;      /* preserve newlines but allow wrapping */
+        word-break: break-word;
+        overflow-wrap: anywhere;
+      }
+
+      /* Raw output blocks also wrap cleanly */
+      pre {
+        background-color: #f0f2f5; color: #222; padding: 1rem; border-radius: 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-wrap: anywhere;
+        font-size: 0.9em; border: 1px solid var(--line);
+        max-width: 100%;
+        overflow-x: hidden;         /* no horizontal scroll bar */
+      }
+
+      .output-section { margin-top: .9rem; }
+      .output-title { margin: .75rem 0 .4rem; font-weight: 700; }
+      .kv-table { width: 100%; border-collapse: collapse; margin-top: .25rem; }
+      .kv-table th, .kv-table td { border: 1px solid var(--line); padding: 8px 10px; }
+      .kv-table th { width: 28%; background: #f7f9fb; font-weight: 600; color: #344; }
+      .kv-table td { background:#fff; color:#222; }
+      .kv-table tr:nth-child(even) td { background:#fbfcfe; }
+
+      details summary { cursor: pointer; color: var(--accent); margin-top:.25rem; }
+      .error { color: var(--err-text); background-color: var(--err-bg); border: 1px solid; padding: 1rem; border-radius: 8px; }
+      .no-match { color: var(--ok-text); background-color: var(--ok-bg); border: 1px solid; padding: 1rem; border-radius: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Upload a file to scan with YARA (SO-Strelka-Container)</h1>
+    <form enctype="multipart/form-data" method="post">
+      <input type="file" name="file" accept="*/*"><br>
+      <input type="submit" value="Upload and Scan">
+      <div class="hint">
+        Rules dir <code>$rules_dir</code> → <code>$rules_ct</code>,
+        scans dir <code>$scans_dir</code> → <code>$scans_ct</code>.
+        Yara Flags: <code>$flags</code> • Max upload: <code>$max_mb MB</code>
+      </div>
+    </form>
+    <div class="results-container">
+      $results
+    </div>
+  </body>
+</html>
+""")
+
+def render_page(results_html: str) -> str:
+    # Use safe_substitute so any '$' inside results_html is left as-is
+    return HTML_PAGE_TEMPLATE.safe_substitute(
+        rules_dir=os.path.abspath(HOST_RULES_DIR),
+        rules_ct=CONTAINER_RULES_DIR,
+        scans_dir=os.path.abspath(HOST_SCANS_DIR),
+        scans_ct=CONTAINER_SCANS_DIR,
+        flags=" ".join(YARA_CLI_FLAGS),
+        max_mb=MAX_UPLOAD_MB,
+        results=results_html
+    )
+
+# =========================
+# Helpers
+# =========================
+def _drain_stream(stream, bytes_to_drain: int):
+    """Read and discard the remaining request body to keep the connection sane."""
+    remaining = max(0, int(bytes_to_drain))
+    while remaining > 0:
+        chunk = stream.read(min(READ_CHUNK_SIZE, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+
+# =========================
+# Docker helpers (exec mode)
+# =========================
+def ensure_directories():
+    # Create dirs and ensure world-readable (so non-root container users can read)
+    os.makedirs(HOST_SCANS_DIR, exist_ok=True)
+    try:
+        os.chmod(HOST_SCANS_DIR, 0o755)
+    except Exception:
+        pass
+
+    if not os.path.isdir(HOST_RULES_DIR):
+        raise RuntimeError(f"Rules directory not found: {os.path.abspath(HOST_RULES_DIR)}")
+    try:
+        os.chmod(HOST_RULES_DIR, 0o755)
+    except Exception:
+        pass
+
+    rules_file_host = os.path.join(HOST_RULES_DIR, DEFAULT_RULES_FILE_NAME)
+    if not os.path.isfile(rules_file_host):
+        raise RuntimeError(f"Rules file not found: {os.path.abspath(rules_file_host)}")
+    try:
+        os.chmod(rules_file_host, 0o644)
+    except Exception:
+        pass
+
+def is_container_running(container_name: str) -> bool:
+    try:
+        probe = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+            capture_output=True, text=True, timeout=10
+        )
+        return probe.returncode == 0 and probe.stdout.strip() == "true"
+    except Exception:
+        return False
+
+def _verify_yara_available() -> None:
+    """Run 'yara -v' (with fallbacks) inside the container to confirm availability."""
+    _probe_yara()
+
+def start_long_lived_container() -> None:
+    """
+    Start (or restart) a minimal long-lived container that keeps running.
+    Override the image ENTRYPOINT to a true idle command so docker exec always works.
+    Also verify that 'yara -v' runs inside the container (older bases may differ in PATH).
+    """
+    if is_container_running(EXEC_CONTAINER_NAME):
+        # Verify YARA exists (bullet-proof check)
+        _verify_yara_available()
+        return
+
+    abs_rules_dir = os.path.abspath(HOST_RULES_DIR)
+    abs_scans_dir = os.path.abspath(HOST_SCANS_DIR)
+
+    # Remove any stale container with this name
+    subprocess.run(["docker", "rm", "-f", EXEC_CONTAINER_NAME], capture_output=True, text=True)
+
+    # Try a few keepalive strategies because images differ (older Security Onion bases included)
+    keepalive_attempts = [
+        (["--entrypoint", "/bin/sh"],          ["-c", "trap : TERM INT; sleep infinity & wait"]),
+        (["--entrypoint", "/usr/bin/tail"],    ["-f", "/dev/null"]),
+        (["--entrypoint", "/bin/tail"],        ["-f", "/dev/null"]),
+        (["--entrypoint", "/bin/sleep"],       ["infinity"]),
+    ]
+
+    last_error = None
+    for entrypoint_args, cmd_args in keepalive_attempts:
+        run_command = [
+            "docker", "run", "-d", "--name", EXEC_CONTAINER_NAME,
+            *DOCKER_RUNTIME_LIMITS,
+            "-v", f"{abs_rules_dir}:{CONTAINER_RULES_DIR}:ro,Z",
+            "-v", f"{abs_scans_dir}:{CONTAINER_SCANS_DIR}:ro,Z",
+            *entrypoint_args,
+            DOCKER_IMAGE_NAME,
+            *cmd_args,
+        ]
+        result = subprocess.run(run_command, capture_output=True, text=True, timeout=30)
+
+        if result.returncode == 0:
+            probe = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", EXEC_CONTAINER_NAME],
+                capture_output=True, text=True, timeout=10
+            )
+            if probe.returncode == 0 and probe.stdout.strip() == "true":
+                try:
+                    _verify_yara_available()   # extra safety check
+                    return  # success
+                except Exception as e:
+                    last_error = f"Container up but YARA unavailable: {e}"
+            else:
+                last_error = f"Container didn't stay running (inspect said: {probe.stdout.strip()})"
+        else:
+            last_error = result.stderr or result.stdout or "unknown error"
+
+        subprocess.run(["docker", "rm", "-f", EXEC_CONTAINER_NAME], capture_output=True, text=True)
+
+    raise RuntimeError(f"Failed to start long-lived container '{EXEC_CONTAINER_NAME}': {last_error}")
+
+
+def _probe_yara():
+    """Find a working YARA binary path inside the container and cache it."""
+    global SELECTED_YARA_BIN
+    if SELECTED_YARA_BIN:
+        return SELECTED_YARA_BIN
+    last_err = None
+    for binpath in YARA_BIN_CANDIDATES:
+        try:
+            res = subprocess.run(
+                ["docker", "exec", EXEC_CONTAINER_NAME, binpath, "-v"],
+                capture_output=True, text=True, timeout=10
+            )
+            if res.returncode == 0:
+                SELECTED_YARA_BIN = binpath
+                return SELECTED_YARA_BIN
+            last_err = res.stderr or res.stdout
+        except Exception as ex:
+            last_err = str(ex)
+    raise RuntimeError(f"YARA not available in container PATH: {last_err or 'unknown error'}")
+
+
+def ensure_container_ready():
+    """Ensure the long-lived container is running and YARA is available."""
+    if not is_container_running(EXEC_CONTAINER_NAME):
+        start_long_lived_container()
+    else:
+        _probe_yara()
+def docker_exec_yara(container_scan_relpath: str):
+    """
+    Run `yara` inside the long-lived container via docker exec.
+    Ensures the container is ready and probes a working YARA binary path once.
+    """
+    container_rules_file = f"{CONTAINER_RULES_DIR}/{DEFAULT_RULES_FILE_NAME}"
+    container_scan_file = f"{CONTAINER_SCANS_DIR}/{container_scan_relpath}"
+
+    # Ensure container and YARA are ready
+    ensure_container_ready()
+
+    selected_bin = _probe_yara()
+
+    # Build and exec the command
+    cmd = ["docker", "exec", EXEC_CONTAINER_NAME, selected_bin, *YARA_CLI_FLAGS, container_rules_file, container_scan_file]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=YARA_SUBPROCESS_TIMEOUT_SECONDS)
+    return res
+
+# =========================
+# YARA 3.11 Output Parsers
+# =========================
+# Header line (with tags and inline metadata):
+#   namespace:rule_name [tag1, tag2] [author="demo",severity="low"] /path/to/file
+HEADER_PATTERN = re.compile(
+    r'^(?!0x[0-9A-Fa-f]+:)'             # do not treat string lines as headers
+    r'(?:(?P<namespace>[^:\s]+):)?'     # optional ns:
+    r'(?P<rule>[^\s\[]+)'               # rule name (no spaces or '[')
+    r'(?P<brackets>(?:\s+\[[^\]]*\])*)' # zero or more [] groups
+    r'\s+(?P<path>.+)$'                 # path / PID
+)
+
+# String line (3.11 without -X): 0x1c:$a: <matched bytes or text>
+STRING_PATTERN = re.compile(
+    r'^0x(?P<offset_hex>[0-9A-Fa-f]+):\s*'
+    r'(?P<string_id>\$\S+)\s*:'
+    r'\s*(?P<matched_data>.*)$'
+)
+
+def extract_tags_and_metadata_from_brackets(bracket_groups_text: str):
+    """
+    From ' [tag1,tag2] [author="demo", severity="low"] ' return (tags_list, metadata_dict).
+    """
+    groups = re.findall(r'\[([^\]]*)\]', bracket_groups_text or "")
+    tags_list, metadata_dict = [], {}
+
+    if not groups:
+        return tags_list, metadata_dict
+
+    metadata_groups = groups
+    if '=' not in groups[0]:
+        tags_list = [t.strip() for t in groups[0].split(',') if t.strip()]
+        metadata_groups = groups[1:]
+
+    pair_re = re.compile(r'([A-Za-z_]\w*)\s*=\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|[^,]+)')
+    for mg in metadata_groups:
+        for match in pair_re.finditer(mg):
+            key = match.group(1)
+            value = match.group(2).strip()
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            metadata_dict[key] = value
+
+    return tags_list, metadata_dict
+
+def parse_yara_output(yara_stdout_text: str):
+    """
+    Parse YARA 3.x CLI output produced with flags like: -w -s -m -e -g
+
+    Relies on module-level:
+      - HEADER_PATTERN
+      - STRING_PATTERN
+      - extract_tags_and_metadata_from_brackets()
+
+    Returns a list of dicts shaped like:
+      {
+        "namespace": str,            # '' if none
+        "rule_name": str,
+        "tags": List[str],
+        "path": str,                 # file/PID as printed by YARA
+        "metadata": Dict[str, Any],  # inline header metadata + meta: block
+        "strings": List[{
+            "offset": str,           # hex string like "0x1c"
+            "id": str,               # "$a"
+            "data": str,             # matched text/bytes as printed
+            "raw": str,              # original line
+        }],
+        "raw_lines": List[str],      # header + any meta:/string lines
+      }
+    """
+    if not yara_stdout_text or not yara_stdout_text.strip():
+        return []
+
+    parsed_matches = []
+    current_rule = None
+    in_metadata_block = False
+
+    def flush_current():
+        nonlocal current_rule, in_metadata_block
+        if current_rule is not None:
+            parsed_matches.append(current_rule)
+        current_rule = None
+        in_metadata_block = False
+
+    for line in yara_stdout_text.splitlines():
+        raw = line.rstrip("\n")
+        trimmed = raw.strip()
+
+        # Blank line: end meta block; nothing else to do
+        if trimmed == "":
+            in_metadata_block = False
+            if current_rule is not None:
+                current_rule["raw_lines"].append(raw)
+            continue
+
+        # -------- 1) Handle meta: block BEFORE header detection --------
+        if trimmed == "meta:" and current_rule is not None:
+            in_metadata_block = True
+            current_rule["raw_lines"].append(raw)
+            continue
+
+        if in_metadata_block and current_rule is not None:
+            # Accept lines like: '  key = "value"' or '  num = 2'
+            m = re.match(r'^\s*([A-Za-z_]\w*)\s*=\s*(.*)$', raw)
+            if m:
+                key = m.group(1)
+                val = m.group(2).strip()
+                # Strip surrounding quotes if present
+                if (len(val) >= 2) and (
+                    (val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")
+                ):
+                    val = val[1:-1]
+                current_rule["metadata"][key] = val
+                current_rule["raw_lines"].append(raw)
+                continue
+            else:
+                # first non-KV line ends the metadata block
+                in_metadata_block = False
+                # fall through to check for strings/headers
+
+        # -------- 2) String match lines --------
+        sm = STRING_PATTERN.match(trimmed)
+        if sm and current_rule is not None:
+            gd = sm.groupdict()
+            off_hex = gd.get("offset_hex")
+            sid = gd.get("string_id")
+            data = gd.get("matched_data")
+
+            # Defensive defaults
+            if off_hex:
+                offset = "0x" + off_hex
+            else:
+                # If somehow missing, keep raw offset unknown but still carry the line
+                offset = None
+
+            current_rule["strings"].append({
+                "offset": offset if offset is not None else "",
+                "id": sid or "",
+                "data": data or "",
+                "raw": raw,
+            })
+            current_rule["raw_lines"].append(raw)
+            continue
+
+        # -------- 3) Header lines --------
+        hm = HEADER_PATTERN.match(trimmed)
+        if hm:
+            # New header => flush the previous rule first
+            flush_current()
+
+            hgd = hm.groupdict()
+            rule = hgd.get("rule")
+            if not rule:
+                # Shouldn't happen with this pattern, but be safe
+                continue
+
+            namespace_value = hgd.get("namespace") or ""
+            brackets_value = hgd.get("brackets") or ""
+            path_value = hgd.get("path") or ""
+
+            tags_list, metadata_inline = extract_tags_and_metadata_from_brackets(brackets_value)
+
+            current_rule = {
+                "namespace": namespace_value,
+                "rule_name": rule,
+                "tags": tags_list,
+                "path": path_value,
+                "metadata": dict(metadata_inline),
+                "strings": [],
+                "raw_lines": [raw],
+            }
+            in_metadata_block = False
+            continue
+
+        # -------- 4) Fallback: keep raw for context if we're in a rule --------
+        if current_rule is not None:
+            current_rule["raw_lines"].append(raw)
+        # else: ignore stray lines outside any header context
+
+    # End of stream
+    flush_current()
+    return parsed_matches
+
+def looks_like_yara_match(stdout_text: str) -> bool:
+    """Heuristic: treat stdout as a match if we see a header or a string line."""
+    if not stdout_text:
+        return False
+    for line_text in stdout_text.splitlines():
+        trimmed = line_text.strip()
+        if not trimmed:
+            continue
+        if HEADER_PATTERN.match(trimmed) or STRING_PATTERN.match(trimmed):
+            return True
+    return False
+
+
+# =========================
+# HTML Formatter
+# =========================
+def format_yara_results(parsed_data):
+    """Produce a rich HTML fragment from parsed YARA matches (3.11 style)."""
+    if not parsed_data:
+        return "<p class='no-match'>✅ No matches found in the file.</p>"
+
+    full_html = "<h2>Scan Results</h2>"
+    for rule_result in parsed_data:
+        rule_title = f"{rule_result['namespace']+':' if rule_result.get('namespace') else ''}{rule_result['rule_name']}"
+        full_html += "<div class='rule-card'>"
+        full_html += f"<div class='rule-header'><div class='rule-title'><h3>Rule: <code>{html.escape(rule_title)}</code></h3></div></div>"
+
+        display_path = rule_result.get('display_path') or rule_result.get('path')
+        if display_path:
+            full_html += f"<div class='rule-meta-top'><strong>File:</strong> <code>{html.escape(display_path)}</code></div>"
+
+        if rule_result.get('tags'):
+            tags_html = "".join(f"<span class='tag'>{html.escape(tag_value)}</span>" for tag_value in rule_result['tags'])
+            full_html += f"<div class='tags-container'><strong>Tags:</strong> {tags_html}</div>"
+
+        # One table per rule, listing CLI-like lines
+        if rule_result.get('strings'):
+            full_html += "<strong>Matches:</strong><table>"
+            full_html += "<tr><th>Match</th></tr>"
+            for string_result in rule_result['strings']:
+                raw_line = string_result.get('raw') or f"{string_result['offset']}:{string_result['id']}: {string_result['data']}"
+                full_html += f"<tr><td><code>{html.escape(raw_line)}</code></td></tr>"
+            full_html += "</table>"
+
+        # Output / Rule Metadata section (two-column key-value table)
+        full_html += "<div class='output-section'>"
+        full_html += "<div class='output-title'>Output / Rule Metadata</div>"
+        if rule_result.get('metadata'):
+            full_html += "<table class='kv-table'>"
+            full_html += "<tr><th>Key</th><th>Value</th></tr>"
+            for metadata_key, metadata_value in rule_result['metadata'].items():
+                full_html += (
+                    f"<tr><td><code>{html.escape(metadata_key)}</code></td>"
+                    f"<td>{html.escape(str(metadata_value))}</td></tr>"
+                )
+            full_html += "</table>"
+        else:
+            full_html += "<div class='rule-meta-top'>No metadata present for this rule.</div>"
+        full_html += "</div>"
+
+        # Per-rule raw output panel
+        if rule_result.get('raw_lines'):
+            rule_raw = "\n".join(rule_result['raw_lines'])
+            full_html += (
+                "<details><summary>Show raw output for this rule</summary>"
+                f"<pre>{html.escape(rule_raw)}</pre></details>"
+            )
+
+        full_html += "</div>"  # end rule-card
+
+    return full_html
+
+
+# =========================
+# HTTP Handler
+# =========================
+class YaraRequestHandler(http.server.BaseHTTPRequestHandler):
+    # server_version = "YaraHTTP/1.0"
+
+    def _send_html(self, body_html: str, status_code: int = 200):
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # Strict CSP: no external loads, allow inline styles, same-origin form submit, local images
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; img-src 'self' data:"
+        )
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        # Extra lightweight hardening
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "accelerometer=(), camera=(), microphone=(), geolocation=(), clipboard-read=(), clipboard-write=(self)")
+        self.end_headers()
+        self.wfile.write(body_html.encode("utf-8"))
+
+    def do_GET(self):
+        try:
+            ensure_directories()
+            ensure_container_ready()
+        except Exception as ex:
+            error_html = f"<p class='error'>Startup check failed: {html.escape(str(ex))}</p>"
+            return self._send_html(render_page(error_html), status_code=500)
+        return self._send_html(render_page(""), status_code=200)
+
+    def do_POST(self):
+        content_type = self.headers.get("Content-Type", "")
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            content_length = 0  # treat missing/invalid as 0
+
+        # Basic validation for missing/invalid length
+        if content_length <= 0:
+            msg = "<p class='error'>Invalid upload: missing or zero Content-Length.</p>"
+            return self._send_html(render_page(msg), status_code=400)
+
+        # Enforce size limit early and DRAIN the body to avoid connection resets
+        if content_length > UPLOAD_SIZE_LIMIT_BYTES:
+            _drain_stream(self.rfile, content_length)
+            self._send_html(
+                render_page(f"<p class='error'>Upload rejected: file too large (limit {MAX_UPLOAD_MB} MB).</p>"),
+                status_code=413,  # Payload Too Large
+            )
+            self.close_connection = True
+            return
+
+        if "multipart/form-data" not in content_type or "boundary=" not in content_type:
+            _drain_stream(self.rfile, content_length)
+            msg = "<p class='error'>Invalid form submission (expected multipart/form-data).</p>"
+            return self._send_html(render_page(msg), status_code=400)
+
+        # Boundary parsing
+        boundary_match = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type)
+        if not boundary_match:
+            _drain_stream(self.rfile, content_length)
+            return self._send_html(render_page("<p class='error'>Invalid multipart boundary.</p>"), status_code=400)
+
+        boundary_value = boundary_match.group(1) or boundary_match.group(2)
+        boundary_bytes = ("--" + boundary_value).encode("utf-8")
+
+        # Body is within limit; safe to read
+        request_body_bytes = self.rfile.read(content_length)
+
+        # Single-exit pattern for the heavy block
+        results_html = ""
+        host_scan_path = None
+
+        try:
+            ensure_directories()
+            ensure_container_ready()
+
+            # Extract file part and original filename (minimal parser)
+            parts_bytes = request_body_bytes.split(boundary_bytes)
+            uploaded_file_bytes = None
+            uploaded_filename = None
+
+            for part_bytes in parts_bytes:
+                if b'Content-Disposition:' not in part_bytes:
+                    continue
+                header_bytes, _, body_bytes = part_bytes.partition(b"\r\n\r\n")
+                if b'name="file"' in header_bytes:
+                    try:
+                        header_text = header_bytes.decode("utf-8", "replace")
+                        filename_match = re.search(r'filename="([^"]+)"', header_text) or \
+                                         re.search(r'filename=([^;\r\n]+)', header_text)
+                        if filename_match:
+                            uploaded_filename = os.path.basename(filename_match.group(1))
+                    except Exception:
+                        uploaded_filename = None
+
+                    body_bytes = body_bytes.rstrip(b"\r\n")
+                    if body_bytes.endswith(b"--"):
+                        body_bytes = body_bytes[:-2]
+                    uploaded_file_bytes = body_bytes
+                    break
+
+            if not uploaded_file_bytes:
+                results_html = "<p class='error'>No file uploaded. Please select a file first.</p>"
+            else:
+                # Save upload with a unique basename under HOST_SCANS_DIR
+                unique_basename = f"upload_{uuid.uuid4().hex}"
+                host_scan_path = os.path.join(HOST_SCANS_DIR, unique_basename)
+                with open(host_scan_path, "wb") as file_handle:
+                    file_handle.write(uploaded_file_bytes)
+
+                try:
+                    # Exec YARA inside the running container
+                    exec_result = docker_exec_yara(unique_basename)
+
+                    stdout = exec_result.stdout or ""
+                    if stdout.count("\n") > MAX_YARA_OUTPUT_LINES:
+                        lines = stdout.splitlines()
+                        stdout = "\n".join(lines[:MAX_YARA_OUTPUT_LINES]) + f"\n[truncated after {MAX_YARA_OUTPUT_LINES} lines]"
+
+
+                    if looks_like_yara_match(stdout):
+                        parsed_results = parse_yara_output(stdout)
+                        if uploaded_filename:
+                            for rule_dict in parsed_results:
+                                rule_dict["display_path"] = uploaded_filename
+                        results_html = format_yara_results(parsed_results)
+                    elif exec_result.returncode == 0 or (exec_result.returncode == 1 and not stdout):
+                        results_html = "<p class='no-match'>✅ No matches found in the file.</p>"
+                    else:
+                        err_text = (exec_result.stderr or "").strip() or "Unknown error"
+                        results_html = (
+                            "<h2>Scan Error</h2>"
+                            f"<pre class='error'>{html.escape(err_text)}</pre>"
+                            "<details><summary>Show raw YARA output</summary>"
+                            f"<pre>{html.escape(stdout)}</pre></details>"
+                        )
+                finally:
+                    # Always clean up the saved upload if we created it
+                    if host_scan_path:
+                        try:
+                            os.unlink(host_scan_path)
+                        except Exception:
+                            pass
+
+        except Exception as ex:
+            # Convert any unexpected exception into user-visible HTML
+            results_html = f"<p class='error'>Processing failed: {html.escape(str(ex))}</p>"
+
+        finally:
+            # Single, guaranteed send
+            self._send_html(render_page(results_html))
+            return
+
+# =========================
+# Main Entrypoint
+# =========================
+if __name__ == "__main__":
+    print(f"Serving on http://127.0.0.1:{SERVER_PORT}")
+    with ThreadingHTTPServer(("", SERVER_PORT), YaraRequestHandler) as http_server:
+        http_server.serve_forever()

@@ -1,0 +1,11 @@
+This is a harmless test file used to validate YARA output formatting.
+
+The safe phrase is SwordFish tucked in here to trip the keyword rule.
+
+A URL to trip the URL rule: https://example.com/just-testing
+
+Here is a fake AWS-style key (for testing only, not real):
+AKIAABCDEFGHIJKLMNOP
+
+XOR stuff
+`d|awuz`{  !':?4;
